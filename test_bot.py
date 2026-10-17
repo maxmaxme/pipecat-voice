@@ -48,7 +48,7 @@ def test_bearer():
 CONFIG = {"noiseReduction": "off", "requestFollowUpMs": 4000, "voice": "marin"}
 
 
-def fake_va(status=200, config=True):
+def fake_va(status=200, config=True, missing_prompt=None):
     """voice-assistant's /mcp (prompts/get + resources/read), as a local aiohttp server."""
 
     async def handle(request):
@@ -61,6 +61,8 @@ def fake_va(status=200, config=True):
                 return web.json_response({"jsonrpc": "2.0", "id": 1, **result})
             text = json.dumps(CONFIG)
             result = {"contents": [{"uri": rpc["params"]["uri"], "mimeType": "application/json", "text": text}]}
+        elif rpc["params"]["name"] == missing_prompt:
+            return web.json_response({"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "unknown prompt"}})
         else:
             name = rpc["params"]["name"]
             result = {"messages": [{"role": "user", "content": {"type": "text", "text": f"prompt {name}"}}]}
@@ -99,6 +101,18 @@ def test_va_setup_unknown_token_is_unauthorized(monkeypatch):
 def test_va_setup_server_error_is_not_unauthorized(monkeypatch):
     with pytest.raises(aiohttp.ClientResponseError):
         run_va_setup("good", monkeypatch, status=500)
+
+
+def test_va_setup_names_a_missing_prompt(monkeypatch):
+    with pytest.raises(RuntimeError, match="tools/request-follow-up.*unknown prompt"):
+        run_va_setup("good", monkeypatch, missing_prompt="tools/request-follow-up")
+
+
+def test_audio_config_treats_null_as_unset():
+    audio = bot.audio_config({"turnDetection": None, "noiseReduction": None, "voice": None})
+    assert audio.input.turn_detection.threshold == 0.3
+    assert audio.input.noise_reduction is None
+    assert audio.output.voice == "marin"
 
 
 def test_audio_config_defaults():

@@ -73,8 +73,21 @@ from pipecat.workers.runner import WorkerRunner
 # the speaker's memory profile — into the container log. INFO keeps turns,
 # transcripts and tool results.
 logger.remove()
-# Own variable: the shared .env's LOG_LEVEL is voice-assistant's (pino, "debug").
-logger.add(sys.stderr, level=os.environ.get("PIPECAT_LOG_LEVEL", "INFO").upper())
+# Every line names its speaker (the client IP, bound per connection in voice()).
+logger.configure(extra={"speaker": "-"})
+LOG_FORMAT = (
+    "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | "
+    "{extra[speaker]} | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>"
+)
+# Own variable rather than LOG_LEVEL, which other services sharing the
+# environment may set in a form loguru rejects. An unknown level falls back to
+# INFO instead of failing the import.
+_level = os.environ.get("PIPECAT_LOG_LEVEL", "INFO").upper()
+try:
+    logger.add(sys.stderr, level=_level, format=LOG_FORMAT)
+except ValueError:
+    logger.add(sys.stderr, level="INFO", format=LOG_FORMAT)
+    logger.warning(f"unknown PIPECAT_LOG_LEVEL {_level!r}, using INFO")
 
 PROTO_VERSION = 2
 DEVICE_MIC_RATE = 16000
@@ -90,6 +103,15 @@ VA_CONFIG_URI = "voice://realtime-config"
 # opens. Accept speech that long after our idle (window + reply drain, the
 # firmware's 1.5 s echo guard and the chime).
 FOLLOW_UP_SLACK_S = 5
+# Question window when voice-assistant's config doesn't say (requestFollowUpMs,
+# followUpChime).
+QUESTION_WINDOW_MS = 4_000
+QUESTION_CHIME = True
+
+# An OpenAI session that fails this soon after connect will most likely fail
+# again on reconnect (bad key, no quota, a panel setting OpenAI rejects): keep
+# the dead connection that long instead of a reconnect storm.
+EARLY_FAILURE_HOLD_S = 60
 
 # OpenAI caps a Realtime session at 60 min; recycle at 50, waiting up to 8 more
 # for the current turn to finish.
@@ -152,8 +174,8 @@ class DeviceProtocol(FrameProcessor):
     def __init__(
         self,
         send_event: Callable[[ClientEvent], Awaitable[None]],
-        follow_up_ms: int = 4_000,
-        follow_up_chime: bool = True,
+        follow_up_ms: int = QUESTION_WINDOW_MS,
+        follow_up_chime: bool = QUESTION_CHIME,
     ):
         super().__init__()
         # Mic window after a reply that asked something (request_follow_up, or
@@ -336,11 +358,15 @@ async def va_setup(token: str) -> tuple[dict[str, str], dict]:
                 resp.raise_for_status()
                 return await resp.json()
 
-        prompts = {}
-        for name in VA_PROMPTS:
-            reply = await call("prompts/get", {"name": name})
-            prompts[name] = reply["result"]["messages"][0]["content"]["text"]
-        reply = await call("resources/read", {"uri": VA_CONFIG_URI})
+        *prompt_replies, reply = await asyncio.gather(
+            *(call("prompts/get", {"name": name}) for name in VA_PROMPTS),
+            call("resources/read", {"uri": VA_CONFIG_URI}),
+        )
+    prompts = {}
+    for name, prompt in zip(VA_PROMPTS, prompt_replies):
+        if "result" not in prompt:
+            raise RuntimeError(f"prompt {name!r}: {prompt.get('error')}")
+        prompts[name] = prompt["result"]["messages"][0]["content"]["text"]
     if "result" not in reply:
         # An older voice-assistant without the resource: run on the defaults.
         logger.warning(f"no realtime config from voice-assistant: {reply.get('error')}")
@@ -348,9 +374,15 @@ async def va_setup(token: str) -> tuple[dict[str, str], dict]:
     return prompts, json.loads(reply["result"]["contents"][0]["text"])
 
 
+def opt(cfg: dict, key: str, default):
+    """A config value, or `default` when voice-assistant left it out or null."""
+    value = cfg.get(key)
+    return default if value is None else value
+
+
 def audio_config(cfg: dict) -> AudioConfiguration:
     """The Realtime audio settings from voice-assistant's Realtime page."""
-    mode = cfg.get("turnDetection", "server_vad")
+    mode = str(opt(cfg, "turnDetection", "server_vad"))
     if mode.startswith("semantic_"):
         turn = SemanticTurnDetection(eagerness=mode.removeprefix("semantic_"))
     else:
@@ -360,12 +392,12 @@ def audio_config(cfg: dict) -> AudioConfiguration:
         turn = TurnDetection(threshold=0.3, silence_duration_ms=900)
     # Default off: the XMOS DSP already cleans the mic, and far_field on top
     # ate short phrases and word onsets.
-    noise = cfg.get("noiseReduction", "off")
+    noise = opt(cfg, "noiseReduction", "off")
     transcription = None
     if cfg.get("transcription"):
         # A second (paid) STT pass, only for the transcript log.
         transcription = InputAudioTranscription(
-            model=cfg.get("transcriptionModel", "gpt-4o-mini-transcribe"),
+            model=opt(cfg, "transcriptionModel", "gpt-4o-mini-transcribe"),
             language=cfg.get("language") or None,
         )
     return AudioConfiguration(
@@ -374,7 +406,7 @@ def audio_config(cfg: dict) -> AudioConfiguration:
             noise_reduction=None if noise == "off" else InputAudioNoiseReduction(type=noise),
             transcription=transcription,
         ),
-        output=AudioOutput(voice=cfg.get("voice", "marin")),
+        output=AudioOutput(voice=opt(cfg, "voice", "marin")),
     )
 
 
@@ -405,8 +437,8 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str], cfg
     )
     device = DeviceProtocol(
         lambda event: llm.send_client_event(event),
-        follow_up_ms=int(cfg.get("requestFollowUpMs", 4_000)),
-        follow_up_chime=bool(cfg.get("followUpChime", True)),
+        follow_up_ms=int(opt(cfg, "requestFollowUpMs", QUESTION_WINDOW_MS)),
+        follow_up_chime=bool(opt(cfg, "followUpChime", QUESTION_CHIME)),
     )
 
     async def wait_for_user(params: FunctionCallParams):
@@ -471,18 +503,26 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str], cfg
     async def on_disconnected(_transport, _client):
         await worker.cancel()
 
+    connected = time.monotonic()
+    drop_at: float | None = None
+
     @worker.event_handler("on_pipeline_error")
     async def on_error(_worker, frame):
         # The realtime service reports a dead OpenAI session (error event,
         # dropped socket) only as a non-permanent ErrorFrame and never
         # reconnects, so the pipeline would idle on silently. Drop the speaker
-        # instead: its reconnect gets a fresh session. A failing tool handler
-        # (APPLICATION) is the model's problem, not the session's.
-        if frame.processor is llm and frame.category is not ErrorCategory.APPLICATION:
-            logger.error(f"OpenAI session failed, dropping the speaker: {frame.error}")
-            await worker.cancel()
+        # instead (the recycle loop does it): its reconnect gets a fresh
+        # session. A failing tool handler (APPLICATION) is the model's problem,
+        # not the session's.
+        nonlocal drop_at
+        if frame.processor is not llm or frame.category is ErrorCategory.APPLICATION or drop_at:
+            return
+        early = time.monotonic() - connected < EARLY_FAILURE_HOLD_S
+        drop_at = time.monotonic() + (EARLY_FAILURE_HOLD_S if early else 0)
+        hold = f", holding {EARLY_FAILURE_HOLD_S} s first" if early else ""
+        logger.error(f"OpenAI session failed, dropping the speaker{hold}: {frame.error}")
 
-    idle_reset_s = int(cfg.get("idleResetMs", 90_000)) / 1000
+    idle_reset_s = int(opt(cfg, "idleResetMs", 90_000)) / 1000
 
     async def recycle():
         # Drop the speaker to start over; its reconnect (≈1 s) gets a fresh
@@ -492,11 +532,12 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str], cfg
         #   quiet stretch (the panel's idle reset, 0 = off);
         # - OpenAI ends a Realtime session at 60 min and Pipecat doesn't
         #   reconnect: go between turns at 50, mid-turn at 58 at the latest.
-        started = time.monotonic()
         while True:
             await asyncio.sleep(1)
-            age = time.monotonic() - started
-            if idle_reset_s and device.idle_for() >= idle_reset_s:
+            age = time.monotonic() - connected
+            if drop_at is not None and time.monotonic() >= drop_at:
+                reason = "OpenAI session failed"
+            elif idle_reset_s and device.idle_for() >= idle_reset_s:
                 reason = "idle reset"
             elif age >= SESSION_RECYCLE_SECS and (
                 not device.busy or age >= SESSION_RECYCLE_SECS + SESSION_GRACE_SECS
@@ -519,29 +560,43 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str], cfg
 
 app = FastAPI()
 
+# Each speaker token's last good prompts + config, so a voice-assistant restart
+# (or outage) doesn't silence a speaker it already authorized: it runs on these,
+# without tools, until voice-assistant is back. In-memory only.
+last_setup: dict[str, tuple[dict[str, str], dict]] = {}
+
 
 @app.websocket("/voice")
 async def voice(websocket: WebSocket):
     await websocket.accept()
+    with logger.contextualize(speaker=websocket.client.host if websocket.client else "?"):
+        await serve_speaker(websocket)
+
+
+async def serve_speaker(websocket: WebSocket):
     token = bearer(websocket.headers.get("authorization"))
     try:
         if not token:
             raise Unauthorized()
         prompts, cfg = await va_setup(token)
+        last_setup[token] = (prompts, cfg)
     except Unauthorized:
         await websocket.close(4401, "unauthorized")
         return
     except Exception as e:
-        logger.error(f"voice-assistant unreachable: {e}")
-        await websocket.close(1011, "voice-assistant unavailable")
-        return
+        if token not in last_setup:
+            logger.error(f"voice-assistant unreachable: {e!r}")
+            await websocket.close(1011, "voice-assistant unavailable")
+            return
+        logger.warning(f"voice-assistant unreachable ({e!r}), using its last prompt and config")
+        prompts, cfg = last_setup[token]
     await websocket.send_text(
         json.dumps(
             {
                 "type": "hello",
                 "proto": PROTO_VERSION,
                 "audioOut": "pcm",
-                "wakeChime": bool(cfg.get("wakeChime", True)),
+                "wakeChime": bool(opt(cfg, "wakeChime", True)),
             }
         )
     )
