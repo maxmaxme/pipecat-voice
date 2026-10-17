@@ -286,14 +286,15 @@ def test_wait_for_user_ends_the_turn_silently():
     assert d.phases()[-1] == ("idle", 1) and follow_ups(d) == []
 
 
-def test_idle_for_counts_from_the_end_of_the_last_turn():
+def test_idle_for_counts_from_the_end_of_the_last_turn(monkeypatch):
     d = Recorder()
     assert d.idle_for() == 0.0  # no turn yet: nothing to reset
     d.feed(start(1), UserStartedSpeakingFrame())
     assert d.idle_for() == 0.0  # in a turn
     d.feed(UserStoppedSpeakingFrame(), BotStartedSpeakingFrame(), reply("Готово."), BotStoppedSpeakingFrame())
-    d._idle_since -= 100
-    assert d.idle_for() >= 100
+    ended = time.monotonic()
+    monkeypatch.setattr(bot.time, "monotonic", lambda: ended + 100)
+    assert 99 <= d.idle_for() <= 101
 
 
 def test_idle_for_waits_out_the_follow_up_window():
