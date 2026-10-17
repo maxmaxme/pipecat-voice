@@ -53,7 +53,6 @@ from pipecat.services.openai.realtime.events import (
     AudioOutput,
     ClientEvent,
     InputAudioBufferClearEvent,
-    InputAudioNoiseReduction,
     InputAudioTranscription,
     ResponseCancelEvent,
     SessionProperties,
@@ -85,7 +84,7 @@ VA_PROMPTS = ("voice-system", "tools/wait-for-user", "tools/request-follow-up")
 
 # Mic window after a reply that asked something (request_follow_up, or a
 # reply ending in "?"); the speaker plays its "your turn" chime first.
-QUESTION_FOLLOW_UP_MS = 10_000
+QUESTION_FOLLOW_UP_MS = 4_000
 QUESTION_FOLLOW_UP_CHIME = True
 # A follow-up turn has no `start`: the device just streams once its window
 # opens. Accept speech that long after our idle (window + reply drain, the
@@ -373,9 +372,11 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str]):
                         # speech the default 0.5 misses; 900 ms keeps a mid-
                         # sentence pause from splitting the turn.
                         turn_detection=TurnDetection(threshold=0.3, silence_duration_ms=900),
-                        noise_reduction=InputAudioNoiseReduction(type="far_field"),
+                        # No OpenAI noise reduction: the XMOS DSP already
+                        # cleans the mic, and stacking far_field on top ate
+                        # whole short phrases and word onsets.
                         # A second (paid) STT pass, only for the transcript log.
-                        transcription=InputAudioTranscription(),
+                        transcription=InputAudioTranscription(model="gpt-4o-mini-transcribe"),
                     ),
                     output=AudioOutput(voice=os.environ.get("OPENAI_REALTIME_VOICE", "marin")),
                 ),
