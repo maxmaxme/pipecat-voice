@@ -6,9 +6,11 @@ minimal — no follow-up window, no multi-speaker wake arbitration, no
 memory/prompts DB.
 """
 
+import asyncio
 import hmac
 import json
 import os
+from collections.abc import Awaitable, Callable
 
 import uvicorn
 from fastapi import FastAPI, WebSocket
@@ -19,6 +21,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     Frame,
+    FunctionCallsStartedFrame,
     InputAudioRawFrame,
     InputTransportMessageFrame,
     OutputAudioRawFrame,
@@ -28,7 +31,7 @@ from pipecat.frames.frames import (
     UserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
@@ -37,6 +40,7 @@ from pipecat.services.mcp_service import MCPClient
 from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
     AudioOutput,
+    ResponseCancelEvent,
     SessionProperties,
 )
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
@@ -56,13 +60,10 @@ DEFAULT_INSTRUCTIONS = (
     "предложениями. Для управления устройствами используй инструменты Home Assistant."
 )
 
-# Pipeline turn frames → the device's LED phase.
-PHASES: dict[type[Frame], str] = {
-    UserStartedSpeakingFrame: "listening",
-    UserStoppedSpeakingFrame: "thinking",
-    BotStartedSpeakingFrame: "replying",
-    BotStoppedSpeakingFrame: "idle",
-}
+# OpenAI caps a Realtime session at 60 min; recycle at 50, waiting up to 8 more
+# for the current turn to finish.
+SESSION_RECYCLE_SECS = 50 * 60
+SESSION_GRACE_SECS = 8 * 60
 
 
 class VoicePeSerializer(FrameSerializer):
@@ -101,20 +102,45 @@ class DeviceProtocol(FrameProcessor):
     downstream and the output transport's Bot*SpeakingFrame upstream copies.
     """
 
-    def __init__(self):
+    def __init__(self, cancel_response: Callable[[], Awaitable[None]]):
         super().__init__()
+        # With server VAD Pipecat's interruption only truncates the playing
+        # item; the generation itself needs an explicit response.cancel.
+        self._cancel_response = cancel_response
         self._turn: int | None = None
         self._phase: str | None = None
+        # Between the device's `start` and our `idle`; phases outside a turn
+        # (a cancelled reply's tail, a barge-in's BotStopped) are not sent.
+        self.in_turn = False
+        self._tool_pending = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+        if not await self._handle(frame):
+            await self.push_frame(frame, direction)
+
+    async def _handle(self, frame: Frame) -> bool:
+        """Returns True when the frame is consumed (device control messages)."""
         if isinstance(frame, InputTransportMessageFrame):
             await self._on_device(frame.message)
-            return
-        phase = PHASES.get(type(frame))
-        if phase:
-            await self._set_phase(phase)
-        await self.push_frame(frame, direction)
+            return True
+        if isinstance(frame, FunctionCallsStartedFrame):
+            self._tool_pending = True
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            await self._set_phase("listening")
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            await self._set_phase("thinking")
+        elif isinstance(frame, BotStartedSpeakingFrame):
+            self._tool_pending = False
+            await self._set_phase("replying")
+        elif isinstance(frame, BotStoppedSpeakingFrame) and self._phase == "replying":
+            # A spoken preamble before a tool call ("сейчас включу…") is not the
+            # end of the turn — the reply after the tool result is.
+            # shortcut: a tool call followed by no audio at all leaves the LED in
+            # `thinking` until the firmware's own watchdog; add an
+            # LLMFullResponseEndFrame fallback if that shows up in practice.
+            await self._set_phase("thinking" if self._tool_pending else "idle")
+        return False
 
     async def _on_device(self, msg: dict):
         kind = msg.get("type")
@@ -126,15 +152,20 @@ class DeviceProtocol(FrameProcessor):
             # disarms its no-speech watchdog.
             self._turn = msg.get("turn")
             self._phase = None
+            self._tool_pending = False
+            self.in_turn = True
+            await self._cancel_response()
             await self.broadcast_interruption()
         elif kind == "interrupt":
+            await self._cancel_response()
             await self.broadcast_interruption()
             await self._set_phase("idle")
 
     async def _set_phase(self, value: str):
-        if value == self._phase:
+        if not self.in_turn or value == self._phase:
             return
         self._phase = value
+        self.in_turn = value != "idle"
         msg = {"type": "phase", "value": value}
         if self._turn is not None:
             msg["turn"] = self._turn
@@ -192,9 +223,19 @@ async def run_bot(websocket: WebSocket):
             ),
         ),
     )
-    user_agg, assistant_agg = LLMContextAggregatorPair(LLMContext())
+    context = LLMContext()
+    # shortcut: private fields, re-check on a Pipecat bump. The service treats
+    # its first context frame as "set up the conversation and respond", which
+    # on a connection with no LLMRunFrame (we don't want the bot to talk on
+    # connect) lands on the first tool result: the output never reaches OpenAI
+    # and the whole history is pasted in as one user text. Pre-seeding makes
+    # every later context frame take the normal tool-result path.
+    llm._context = context
+    llm._llm_needs_conversation_setup = False
+    user_agg, assistant_agg = LLMContextAggregatorPair(context)
+    device = DeviceProtocol(lambda: llm.send_client_event(ResponseCancelEvent()))
     pipeline = Pipeline(
-        [transport.input(), user_agg, llm, DeviceProtocol(), transport.output(), assistant_agg]
+        [transport.input(), user_agg, llm, device, transport.output(), assistant_agg]
     )
     worker = PipelineWorker(
         pipeline,
@@ -205,15 +246,34 @@ async def run_bot(websocket: WebSocket):
         idle_timeout_secs=None,
         # RTVI is Pipecat's own client protocol; the speaker speaks ours.
         enable_rtvi=False,
+        # A dead OpenAI session ends the pipeline (→ socket closes → the
+        # speaker reconnects) instead of silently swallowing every turn.
+        processor_unusable_policy=ProcessorUnusablePolicy.END,
     )
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(_transport, _client):
         await worker.cancel()
 
+    async def recycle_before_session_cap():
+        # OpenAI ends a Realtime session at 60 min and Pipecat doesn't
+        # reconnect. Drop the speaker between turns before that; its reconnect
+        # gets a fresh session (and re-fetches HA tools if HA was down).
+        await asyncio.sleep(SESSION_RECYCLE_SECS)
+        for _ in range(SESSION_GRACE_SECS):
+            if not device.in_turn:
+                break
+            await asyncio.sleep(1)
+        logger.info("recycling speaker connection ahead of OpenAI's session cap")
+        await worker.cancel()
+
+    recycle = asyncio.create_task(recycle_before_session_cap())
     runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(worker)
-    await runner.run()
+    try:
+        await runner.run()
+    finally:
+        recycle.cancel()
 
 
 app = FastAPI()
