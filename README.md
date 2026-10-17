@@ -15,6 +15,7 @@ Not implemented: the ambient after-every-reply follow-up window (only questions 
 | `OPENAI_REALTIME_MODEL` | no | defaults to Pipecat's default realtime model |
 | `OPENAI_REALTIME_VOICE` | no | default `marin` |
 | `PORT` | no | default `3002` |
+| `LOG_LEVEL` | no | default `INFO`; `DEBUG` also logs the system prompt, which carries the speaker's memory |
 
 ## Dev
 

@@ -11,6 +11,7 @@ the only device-side change. No multi-speaker wake arbitration.
 import asyncio
 import json
 import os
+import sys
 import time
 from collections.abc import Awaitable, Callable
 
@@ -52,6 +53,7 @@ from pipecat.services.openai.realtime.events import (
     ClientEvent,
     InputAudioBufferClearEvent,
     InputAudioNoiseReduction,
+    InputAudioTranscription,
     ResponseCancelEvent,
     SessionProperties,
     TurnDetection,
@@ -63,6 +65,12 @@ from pipecat.transports.websocket.fastapi import (
 )
 from pipecat.utils.errors import ErrorCategory
 from pipecat.workers.runner import WorkerRunner
+
+# Pipecat logs at DEBUG by default, which dumps the system prompt — and with it
+# the speaker's memory profile — into the container log. INFO keeps turns,
+# transcripts and tool results.
+logger.remove()
+logger.add(sys.stderr, level=os.environ.get("LOG_LEVEL", "INFO"))
 
 PROTO_VERSION = 2
 DEVICE_MIC_RATE = 16000
@@ -348,6 +356,8 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str]):
                         # sentence pause from splitting the turn.
                         turn_detection=TurnDetection(threshold=0.3, silence_duration_ms=900),
                         noise_reduction=InputAudioNoiseReduction(type="far_field"),
+                        # A second (paid) STT pass, only for the transcript log.
+                        transcription=InputAudioTranscription(),
                     ),
                     output=AudioOutput(voice=os.environ.get("OPENAI_REALTIME_VOICE", "marin")),
                 ),
@@ -377,6 +387,14 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str]):
         # RTVI is Pipecat's own client protocol; the speaker speaks ours.
         enable_rtvi=False,
     )
+
+    @user_agg.event_handler("on_user_turn_message_added")
+    async def on_user_text(_aggregator, message):
+        logger.info(f"user → {message.content}")
+
+    @assistant_agg.event_handler("on_assistant_turn_stopped")
+    async def on_assistant_text(_aggregator, message):
+        logger.info(f"assistant → {message.content}{' (interrupted)' if message.interrupted else ''}")
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(_transport, _client):
