@@ -176,6 +176,10 @@ class DeviceProtocol(FrameProcessor):
         # time.monotonic() until which speech without `start` continues the
         # turn (the device's follow-up window).
         self._follow_up_until = 0.0
+        # Idle reset: whether this connection has had a turn, and since when
+        # the device has been quiet.
+        self._had_turn = False
+        self._idle_since = time.monotonic()
 
     @property
     def in_turn(self) -> bool:
@@ -188,6 +192,12 @@ class DeviceProtocol(FrameProcessor):
     def busy(self) -> bool:
         """In a turn, or the device's follow-up window may still continue one."""
         return self.in_turn or time.monotonic() < self._follow_up_until
+
+    def idle_for(self) -> float:
+        """Seconds of quiet since the last turn; 0 before any turn or while busy."""
+        if not self._had_turn or self.busy:
+            return 0.0
+        return time.monotonic() - max(self._idle_since, self._follow_up_until)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -258,6 +268,7 @@ class DeviceProtocol(FrameProcessor):
             # `listening` echo — to the firmware that means "speech heard" and
             # disarms its no-speech watchdog.
             self._turn = msg.get("turn")
+            self._had_turn = True
             self._phase = None
             self._tool_pending = False
             self._follow_up_until = 0.0
@@ -277,6 +288,8 @@ class DeviceProtocol(FrameProcessor):
         if not self.in_turn or value == self._phase:
             return
         self._phase = value
+        if value == "idle":
+            self._idle_since = time.monotonic()
         if value in ("listening", "thinking"):
             self._reply_text = ""
         if value == "listening":
@@ -469,26 +482,39 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str], cfg
             logger.error(f"OpenAI session failed, dropping the speaker: {frame.error}")
             await worker.cancel()
 
-    async def recycle_before_session_cap():
-        # OpenAI ends a Realtime session at 60 min and Pipecat doesn't
-        # reconnect. Drop the speaker between turns before that; its reconnect
-        # gets a fresh session, re-reads tools and prompt from voice-assistant
-        # (web-panel edits, new memory) and retries them if it was down.
-        await asyncio.sleep(SESSION_RECYCLE_SECS)
-        for _ in range(SESSION_GRACE_SECS):
-            if not device.busy:
-                break
+    idle_reset_s = int(cfg.get("idleResetMs", 90_000)) / 1000
+
+    async def recycle():
+        # Drop the speaker to start over; its reconnect (≈1 s) gets a fresh
+        # OpenAI session and re-reads tools, prompt (with new memory) and config
+        # from voice-assistant. Two reasons:
+        # - idle reset: a voice conversation shouldn't carry context across a
+        #   quiet stretch (the panel's idle reset, 0 = off);
+        # - OpenAI ends a Realtime session at 60 min and Pipecat doesn't
+        #   reconnect: go between turns at 50, mid-turn at 58 at the latest.
+        started = time.monotonic()
+        while True:
             await asyncio.sleep(1)
-        logger.info("recycling speaker connection ahead of OpenAI's session cap")
-        await worker.cancel()
+            age = time.monotonic() - started
+            if idle_reset_s and device.idle_for() >= idle_reset_s:
+                reason = "idle reset"
+            elif age >= SESSION_RECYCLE_SECS and (
+                not device.busy or age >= SESSION_RECYCLE_SECS + SESSION_GRACE_SECS
+            ):
+                reason = "OpenAI session cap"
+            else:
+                continue
+            logger.info(f"recycling speaker connection: {reason}")
+            await worker.cancel()
+            return
 
     runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(worker)
-    recycle = asyncio.create_task(recycle_before_session_cap())
+    recycler = asyncio.create_task(recycle())
     try:
         await runner.run()
     finally:
-        recycle.cancel()
+        recycler.cancel()
 
 
 app = FastAPI()
