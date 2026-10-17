@@ -32,6 +32,7 @@ from pipecat.frames.frames import (
     OutputAudioRawFrame,
     OutputTransportMessageFrame,
     OutputTransportMessageUrgentFrame,
+    TranscriptionFrame,
     TTSTextFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
@@ -127,6 +128,19 @@ class VoicePeSerializer(FrameSerializer):
             logger.warning(f"bad device message: {data!r}")
             return None
         return InputTransportMessageFrame(message=msg)
+
+
+class TranscriptLog(FrameProcessor):
+    """Logs what the speaker heard. Sits between the user aggregator and the LLM:
+    the realtime service sends user transcripts upstream, and they arrive after
+    the turn was already handed to OpenAI, so the aggregator's own events can
+    miss them."""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame):
+            logger.info(f"user → {frame.text}")
+        await self.push_frame(frame, direction)
 
 
 class DeviceProtocol(FrameProcessor):
@@ -225,6 +239,8 @@ class DeviceProtocol(FrameProcessor):
 
     async def _on_device(self, msg: dict):
         kind = msg.get("type")
+        if kind != "ping":
+            logger.info(f"device {kind} {msg.get('turn', '')}".rstrip())
         if kind == "ping":
             await self._send({"type": "pong"})
         elif kind == "start":
@@ -261,6 +277,7 @@ class DeviceProtocol(FrameProcessor):
         """Turn-scoped message: stamped with the device's turn id (proto 2)."""
         if self._turn is not None:
             msg["turn"] = self._turn
+        logger.info(f"→ {msg['type']} {msg.get('value', msg.get('ms', ''))}")
         await self._send(msg)
 
     async def _send(self, msg: dict):
@@ -376,7 +393,7 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str]):
     llm._llm_needs_conversation_setup = False
     user_agg, assistant_agg = LLMContextAggregatorPair(context)
     pipeline = Pipeline(
-        [transport.input(), user_agg, llm, device, transport.output(), assistant_agg]
+        [transport.input(), user_agg, TranscriptLog(), llm, device, transport.output(), assistant_agg]
     )
     worker = PipelineWorker(
         pipeline,
@@ -388,10 +405,6 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str]):
         # RTVI is Pipecat's own client protocol; the speaker speaks ours.
         enable_rtvi=False,
     )
-
-    @user_agg.event_handler("on_user_turn_message_added")
-    async def on_user_text(_aggregator, message):
-        logger.info(f"user → {message.content}")
 
     @assistant_agg.event_handler("on_assistant_turn_stopped")
     async def on_assistant_text(_aggregator, message):
