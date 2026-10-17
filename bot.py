@@ -31,7 +31,7 @@ from pipecat.frames.frames import (
     UserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
@@ -40,6 +40,8 @@ from pipecat.services.mcp_service import MCPClient
 from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
     AudioOutput,
+    ClientEvent,
+    InputAudioBufferClearEvent,
     ResponseCancelEvent,
     SessionProperties,
 )
@@ -48,6 +50,7 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
+from pipecat.utils.errors import ErrorCategory
 from pipecat.workers.runner import WorkerRunner
 
 PROTO_VERSION = 2
@@ -89,10 +92,13 @@ class VoicePeSerializer(FrameSerializer):
             audio = await self._resampler.resample(data, DEVICE_MIC_RATE, self._in_rate)
             return InputAudioRawFrame(audio=audio, sample_rate=self._in_rate, num_channels=1)
         try:
-            return InputTransportMessageFrame(message=json.loads(data))
+            msg = json.loads(data)
         except json.JSONDecodeError:
+            msg = None
+        if not isinstance(msg, dict):
             logger.warning(f"bad device message: {data!r}")
             return None
+        return InputTransportMessageFrame(message=msg)
 
 
 class DeviceProtocol(FrameProcessor):
@@ -102,17 +108,23 @@ class DeviceProtocol(FrameProcessor):
     downstream and the output transport's Bot*SpeakingFrame upstream copies.
     """
 
-    def __init__(self, cancel_response: Callable[[], Awaitable[None]]):
+    def __init__(self, send_event: Callable[[ClientEvent], Awaitable[None]]):
         super().__init__()
-        # With server VAD Pipecat's interruption only truncates the playing
-        # item; the generation itself needs an explicit response.cancel.
-        self._cancel_response = cancel_response
+        # Raw OpenAI Realtime client events: with server VAD Pipecat's
+        # interruption only truncates the playing item, so cancelling the
+        # generation itself is on us.
+        self._send_event = send_event
         self._turn: int | None = None
-        self._phase: str | None = None
-        # Between the device's `start` and our `idle`; phases outside a turn
-        # (a cancelled reply's tail, a barge-in's BotStopped) are not sent.
-        self.in_turn = False
+        # `idle` = outside a turn; `start` opens one with phase None.
+        self._phase: str | None = "idle"
         self._tool_pending = False
+
+    @property
+    def in_turn(self) -> bool:
+        """Between the device's `start` and our `idle`. Phases and reply audio
+        outside a turn (a cancelled reply's tail, a barge-in's BotStopped) are
+        dropped, not sent to the speaker."""
+        return self._phase != "idle"
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -120,10 +132,13 @@ class DeviceProtocol(FrameProcessor):
             await self.push_frame(frame, direction)
 
     async def _handle(self, frame: Frame) -> bool:
-        """Returns True when the frame is consumed (device control messages)."""
+        """Returns True when the frame is consumed (device control messages,
+        reply audio outside a turn)."""
         if isinstance(frame, InputTransportMessageFrame):
             await self._on_device(frame.message)
             return True
+        if isinstance(frame, OutputAudioRawFrame):
+            return not self.in_turn
         if isinstance(frame, FunctionCallsStartedFrame):
             self._tool_pending = True
         elif isinstance(frame, UserStartedSpeakingFrame):
@@ -153,11 +168,14 @@ class DeviceProtocol(FrameProcessor):
             self._turn = msg.get("turn")
             self._phase = None
             self._tool_pending = False
-            self.in_turn = True
-            await self._cancel_response()
+            await self._send_event(ResponseCancelEvent())
             await self.broadcast_interruption()
         elif kind == "interrupt":
-            await self._cancel_response()
+            await self._send_event(ResponseCancelEvent())
+            # The mic closed mid-segment ("стоп" included); drop it so it
+            # neither becomes a reply nor prefixes the next turn's speech. Not
+            # on `start`: the new turn's first audio may already be in there.
+            await self._send_event(InputAudioBufferClearEvent())
             await self.broadcast_interruption()
             await self._set_phase("idle")
 
@@ -165,7 +183,6 @@ class DeviceProtocol(FrameProcessor):
         if not self.in_turn or value == self._phase:
             return
         self._phase = value
-        self.in_turn = value != "idle"
         msg = {"type": "phase", "value": value}
         if self._turn is not None:
             msg["turn"] = self._turn
@@ -184,6 +201,7 @@ def token_ok(header: str | None) -> bool:
 async def ha_tools():
     ha_url, ha_token = os.environ.get("HA_URL"), os.environ.get("HA_TOKEN")
     if not (ha_url and ha_token):
+        logger.warning("HA_URL/HA_TOKEN not set, running without HA tools")
         return None
     mcp = MCPClient(
         server_params=StreamableHttpParameters(
@@ -196,6 +214,7 @@ async def ha_tools():
     except Exception as e:
         # The voice path must survive HA being down — talk without tools.
         logger.error(f"HA MCP unavailable, running without tools: {e}")
+        await mcp.close()
         return None
 
 
@@ -233,7 +252,7 @@ async def run_bot(websocket: WebSocket):
     llm._context = context
     llm._llm_needs_conversation_setup = False
     user_agg, assistant_agg = LLMContextAggregatorPair(context)
-    device = DeviceProtocol(lambda: llm.send_client_event(ResponseCancelEvent()))
+    device = DeviceProtocol(llm.send_client_event)
     pipeline = Pipeline(
         [transport.input(), user_agg, llm, device, transport.output(), assistant_agg]
     )
@@ -246,14 +265,22 @@ async def run_bot(websocket: WebSocket):
         idle_timeout_secs=None,
         # RTVI is Pipecat's own client protocol; the speaker speaks ours.
         enable_rtvi=False,
-        # A dead OpenAI session ends the pipeline (→ socket closes → the
-        # speaker reconnects) instead of silently swallowing every turn.
-        processor_unusable_policy=ProcessorUnusablePolicy.END,
     )
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnected(_transport, _client):
         await worker.cancel()
+
+    @worker.event_handler("on_pipeline_error")
+    async def on_error(_worker, frame):
+        # The realtime service reports a dead OpenAI session (error event,
+        # dropped socket) only as a non-permanent ErrorFrame and never
+        # reconnects, so the pipeline would idle on silently. Drop the speaker
+        # instead: its reconnect gets a fresh session. A failing tool handler
+        # (APPLICATION) is the model's problem, not the session's.
+        if frame.processor is llm and frame.category is not ErrorCategory.APPLICATION:
+            logger.error(f"OpenAI session failed, dropping the speaker: {frame.error}")
+            await worker.cancel()
 
     async def recycle_before_session_cap():
         # OpenAI ends a Realtime session at 60 min and Pipecat doesn't
@@ -267,9 +294,9 @@ async def run_bot(websocket: WebSocket):
         logger.info("recycling speaker connection ahead of OpenAI's session cap")
         await worker.cancel()
 
-    recycle = asyncio.create_task(recycle_before_session_cap())
     runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(worker)
+    recycle = asyncio.create_task(recycle_before_session_cap())
     try:
         await runner.run()
     finally:
