@@ -70,7 +70,8 @@ from pipecat.workers.runner import WorkerRunner
 # the speaker's memory profile — into the container log. INFO keeps turns,
 # transcripts and tool results.
 logger.remove()
-logger.add(sys.stderr, level=os.environ.get("LOG_LEVEL", "INFO"))
+# Own variable: the shared .env's LOG_LEVEL is voice-assistant's (pino, "debug").
+logger.add(sys.stderr, level=os.environ.get("PIPECAT_LOG_LEVEL", "INFO").upper())
 
 PROTO_VERSION = 2
 DEVICE_MIC_RATE = 16000
