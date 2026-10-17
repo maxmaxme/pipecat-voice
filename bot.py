@@ -53,8 +53,11 @@ from pipecat.services.openai.realtime.events import (
     AudioOutput,
     ClientEvent,
     InputAudioBufferClearEvent,
+    InputAudioNoiseReduction,
     InputAudioTranscription,
+    Reasoning,
     ResponseCancelEvent,
+    SemanticTurnDetection,
     SessionProperties,
     TurnDetection,
 )
@@ -81,11 +84,8 @@ PIPELINE_RATE = 24000
 # voice-assistant's voice MCP; speaker-scoped by the device token we forward.
 VA_MCP_URL = os.environ.get("VA_MCP_URL", "http://voice-assistant:3000/mcp")
 VA_PROMPTS = ("voice-system", "tools/wait-for-user", "tools/request-follow-up")
+VA_CONFIG_URI = "voice://realtime-config"
 
-# Mic window after a reply that asked something (request_follow_up, or a
-# reply ending in "?"); the speaker plays its "your turn" chime first.
-QUESTION_FOLLOW_UP_MS = 4_000
-QUESTION_FOLLOW_UP_CHIME = True
 # A follow-up turn has no `start`: the device just streams once its window
 # opens. Accept speech that long after our idle (window + reply drain, the
 # firmware's 1.5 s echo guard and the chime).
@@ -149,8 +149,18 @@ class DeviceProtocol(FrameProcessor):
     downstream and the output transport's Bot*SpeakingFrame upstream copies.
     """
 
-    def __init__(self, send_event: Callable[[ClientEvent], Awaitable[None]]):
+    def __init__(
+        self,
+        send_event: Callable[[ClientEvent], Awaitable[None]],
+        follow_up_ms: int = 4_000,
+        follow_up_chime: bool = True,
+    ):
         super().__init__()
+        # Mic window after a reply that asked something (request_follow_up, or
+        # a reply ending in "?"); 0 = never. The chime is the speaker's "your
+        # turn" cue before it opens.
+        self._follow_up_ms = follow_up_ms
+        self._follow_up_chime = follow_up_chime
         # Raw OpenAI Realtime client events: with server VAD Pipecat's
         # interruption only truncates the playing item, so cancelling the
         # generation itself is on us.
@@ -219,13 +229,14 @@ class DeviceProtocol(FrameProcessor):
         return False
 
     async def _end_reply(self):
-        if self._question or self._reply_text.rstrip().endswith("?"):
+        asked = self._question or self._reply_text.rstrip().endswith("?")
+        if asked and self._follow_up_ms > 0:
             # Sent right before the idle: the device latches it and opens the
             # mic once the reply has drained.
             await self._send_turn(
-                {"type": "follow_up", "ms": QUESTION_FOLLOW_UP_MS, "chime": QUESTION_FOLLOW_UP_CHIME}
+                {"type": "follow_up", "ms": self._follow_up_ms, "chime": self._follow_up_chime}
             )
-            self._follow_up_until = time.monotonic() + QUESTION_FOLLOW_UP_MS / 1000 + FOLLOW_UP_SLACK_S
+            self._follow_up_until = time.monotonic() + self._follow_up_ms / 1000 + FOLLOW_UP_SLACK_S
         await self._set_phase("idle")
 
     async def request_follow_up(self):
@@ -293,25 +304,65 @@ def bearer(header: str | None) -> str | None:
     return header.removeprefix("Bearer ").strip() or None
 
 
-async def va_prompts(token: str) -> dict[str, str]:
-    """The speaker's prompts from voice-assistant; also its authentication.
+async def va_setup(token: str) -> tuple[dict[str, str], dict]:
+    """The speaker's prompts and realtime config from voice-assistant; also its
+    authentication.
 
     Plain JSON-RPC against the stateless MCP endpoint rather than the MCP SDK
     client: the SDK folds HTTP 401 into a generic error, and telling "unknown
     speaker" (close 4401) from "voice-assistant down" is the point here.
     """
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json, text/event-stream"}
-    prompts = {}
     async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as http:
-        for name in VA_PROMPTS:
-            body = {"jsonrpc": "2.0", "id": 1, "method": "prompts/get", "params": {"name": name}}
+
+        async def call(method: str, params: dict) -> dict:
+            body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
             async with http.post(VA_MCP_URL, json=body) as resp:
                 if resp.status == 401:
                     raise Unauthorized()
                 resp.raise_for_status()
-                reply = await resp.json()
+                return await resp.json()
+
+        prompts = {}
+        for name in VA_PROMPTS:
+            reply = await call("prompts/get", {"name": name})
             prompts[name] = reply["result"]["messages"][0]["content"]["text"]
-    return prompts
+        reply = await call("resources/read", {"uri": VA_CONFIG_URI})
+    if "result" not in reply:
+        # An older voice-assistant without the resource: run on the defaults.
+        logger.warning(f"no realtime config from voice-assistant: {reply.get('error')}")
+        return prompts, {}
+    return prompts, json.loads(reply["result"]["contents"][0]["text"])
+
+
+def audio_config(cfg: dict) -> AudioConfiguration:
+    """The Realtime audio settings from voice-assistant's Realtime page."""
+    mode = cfg.get("turnDetection", "server_vad")
+    if mode.startswith("semantic_"):
+        turn = SemanticTurnDetection(eagerness=mode.removeprefix("semantic_"))
+    else:
+        # voice-assistant's tuned server VAD: 0.3 hears quiet far-field speech
+        # the default 0.5 misses; 900 ms keeps a mid-sentence pause from
+        # splitting the turn.
+        turn = TurnDetection(threshold=0.3, silence_duration_ms=900)
+    # Default off: the XMOS DSP already cleans the mic, and far_field on top
+    # ate short phrases and word onsets.
+    noise = cfg.get("noiseReduction", "off")
+    transcription = None
+    if cfg.get("transcription"):
+        # A second (paid) STT pass, only for the transcript log.
+        transcription = InputAudioTranscription(
+            model=cfg.get("transcriptionModel", "gpt-4o-mini-transcribe"),
+            language=cfg.get("language") or None,
+        )
+    return AudioConfiguration(
+        input=AudioInput(
+            turn_detection=turn,
+            noise_reduction=None if noise == "off" else InputAudioNoiseReduction(type=noise),
+            transcription=transcription,
+        ),
+        output=AudioOutput(voice=cfg.get("voice", "marin")),
+    )
 
 
 async def va_tools(token: str) -> list[FunctionSchema]:
@@ -330,7 +381,7 @@ async def va_tools(token: str) -> list[FunctionSchema]:
         return []
 
 
-async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str]):
+async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str], cfg: dict):
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
@@ -339,7 +390,11 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str]):
             serializer=VoicePeSerializer(),
         ),
     )
-    device = DeviceProtocol(lambda event: llm.send_client_event(event))
+    device = DeviceProtocol(
+        lambda event: llm.send_client_event(event),
+        follow_up_ms=int(cfg.get("requestFollowUpMs", 4_000)),
+        follow_up_chime=bool(cfg.get("followUpChime", True)),
+    )
 
     async def wait_for_user(params: FunctionCallParams):
         await device.wait_for_user()
@@ -357,29 +412,17 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str]):
         ),
         *await va_tools(token),
     ]
-    model = os.environ.get("OPENAI_REALTIME_MODEL")
+    effort = cfg.get("reasoningEffort")
     llm = OpenAIRealtimeLLMService(
         api_key=os.environ["OPENAI_API_KEY"],
         settings=OpenAIRealtimeLLMService.Settings(
-            **({"model": model} if model else {}),
+            **({"model": cfg["model"]} if cfg.get("model") else {}),
             system_instruction=prompts["voice-system"],
             session_properties=SessionProperties(
                 # Session-level tools go out on connect, before the first turn.
                 tools=ToolsSchema(standard_tools=tools),
-                audio=AudioConfiguration(
-                    input=AudioInput(
-                        # voice-assistant's tuned VAD: 0.3 hears quiet far-field
-                        # speech the default 0.5 misses; 900 ms keeps a mid-
-                        # sentence pause from splitting the turn.
-                        turn_detection=TurnDetection(threshold=0.3, silence_duration_ms=900),
-                        # No OpenAI noise reduction: the XMOS DSP already
-                        # cleans the mic, and stacking far_field on top ate
-                        # whole short phrases and word onsets.
-                        # A second (paid) STT pass, only for the transcript log.
-                        transcription=InputAudioTranscription(model="gpt-4o-mini-transcribe"),
-                    ),
-                    output=AudioOutput(voice=os.environ.get("OPENAI_REALTIME_VOICE", "marin")),
-                ),
+                audio=audio_config(cfg),
+                reasoning=Reasoning(effort=effort) if effort else None,
             ),
         ),
     )
@@ -458,7 +501,7 @@ async def voice(websocket: WebSocket):
     try:
         if not token:
             raise Unauthorized()
-        prompts = await va_prompts(token)
+        prompts, cfg = await va_setup(token)
     except Unauthorized:
         await websocket.close(4401, "unauthorized")
         return
@@ -467,10 +510,18 @@ async def voice(websocket: WebSocket):
         await websocket.close(1011, "voice-assistant unavailable")
         return
     await websocket.send_text(
-        json.dumps({"type": "hello", "proto": PROTO_VERSION, "audioOut": "pcm", "wakeChime": True})
+        json.dumps(
+            {
+                "type": "hello",
+                "proto": PROTO_VERSION,
+                "audioOut": "pcm",
+                "wakeChime": bool(cfg.get("wakeChime", True)),
+            }
+        )
     )
     logger.info("speaker connected")
-    await run_bot(websocket, token, prompts)
+    logger.info(f"realtime config: {cfg}")
+    await run_bot(websocket, token, prompts, cfg)
     logger.info("speaker disconnected")
 
 

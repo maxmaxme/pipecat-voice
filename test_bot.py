@@ -44,46 +44,87 @@ def test_bearer():
     assert bot.bearer(None) is None
 
 
-def fake_va(status=200):
-    """voice-assistant's /mcp answering prompts/get, as a local aiohttp server."""
+CONFIG = {"noiseReduction": "off", "requestFollowUpMs": 4000, "voice": "marin"}
+
+
+def fake_va(status=200, config=True):
+    """voice-assistant's /mcp (prompts/get + resources/read), as a local aiohttp server."""
 
     async def handle(request):
         if request.headers.get("Authorization") != "Bearer good":
             return web.json_response({"error": "Unauthorized"}, status=401)
-        name = (await request.json())["params"]["name"]
-        text = {"type": "text", "text": f"prompt {name}"}
-        return web.json_response(
-            {"jsonrpc": "2.0", "id": 1, "result": {"messages": [{"role": "user", "content": text}]}},
-            status=status,
-        )
+        rpc = await request.json()
+        if rpc["method"] == "resources/read":
+            if not config:
+                result = {"error": {"code": -32601, "message": "Method not found"}}
+                return web.json_response({"jsonrpc": "2.0", "id": 1, **result})
+            text = json.dumps(CONFIG)
+            result = {"contents": [{"uri": rpc["params"]["uri"], "mimeType": "application/json", "text": text}]}
+        else:
+            name = rpc["params"]["name"]
+            result = {"messages": [{"role": "user", "content": {"type": "text", "text": f"prompt {name}"}}]}
+        return web.json_response({"jsonrpc": "2.0", "id": 1, "result": result}, status=status)
 
     app = web.Application()
     app.router.add_post("/mcp", handle)
     return TestServer(app)
 
 
-def run_va_prompts(token, monkeypatch, status=200):
+def run_va_setup(token, monkeypatch, **kwargs):
     async def go():
-        async with fake_va(status) as server:
+        async with fake_va(**kwargs) as server:
             monkeypatch.setattr(bot, "VA_MCP_URL", str(server.make_url("/mcp")))
-            return await bot.va_prompts(token)
+            return await bot.va_setup(token)
 
     return asyncio.run(go())
 
 
-def test_va_prompts_reads_the_speaker_prompts(monkeypatch):
-    prompts = run_va_prompts("good", monkeypatch)
+def test_va_setup_reads_prompts_and_config(monkeypatch):
+    prompts, cfg = run_va_setup("good", monkeypatch)
     assert prompts == {name: f"prompt {name}" for name in bot.VA_PROMPTS}
+    assert cfg == CONFIG
 
 
-def test_va_prompts_unknown_token_is_unauthorized(monkeypatch):
+def test_va_setup_without_the_config_resource_runs_on_defaults(monkeypatch):
+    _, cfg = run_va_setup("good", monkeypatch, config=False)
+    assert cfg == {}
+
+
+def test_va_setup_unknown_token_is_unauthorized(monkeypatch):
     with pytest.raises(bot.Unauthorized):
-        run_va_prompts("bad", monkeypatch)
+        run_va_setup("bad", monkeypatch)
 
 
-def test_va_prompts_server_error_is_not_unauthorized(monkeypatch):
+def test_va_setup_server_error_is_not_unauthorized(monkeypatch):
     with pytest.raises(aiohttp.ClientResponseError):
-        run_va_prompts("good", monkeypatch, status=500)
+        run_va_setup("good", monkeypatch, status=500)
+
+
+def test_audio_config_defaults():
+    audio = bot.audio_config({})
+    assert audio.input.turn_detection.threshold == 0.3
+    assert audio.input.turn_detection.silence_duration_ms == 900
+    assert audio.input.noise_reduction is None
+    assert audio.input.transcription is None
+    assert audio.output.voice == "marin"
+
+
+def test_audio_config_follows_the_panel():
+    audio = bot.audio_config(
+        {
+            "turnDetection": "semantic_low",
+            "noiseReduction": "far_field",
+            "transcription": True,
+            "transcriptionModel": "whisper-1",
+            "language": "ru",
+            "voice": "cedar",
+        }
+    )
+    assert audio.input.turn_detection.type == "semantic_vad"
+    assert audio.input.turn_detection.eagerness == "low"
+    assert audio.input.noise_reduction.type == "far_field"
+    assert (audio.input.transcription.model, audio.input.transcription.language) == ("whisper-1", "ru")
+    assert audio.output.voice == "cedar"
 
 
 class Recorder(bot.DeviceProtocol):
@@ -201,8 +242,15 @@ def test_plain_reply_opens_no_window():
 def test_reply_ending_in_question_opens_a_window_before_idle():
     d = Recorder()
     asked(d, reply("В какой "), reply("комнате? "))
-    assert d.sent[-2] == {"type": "follow_up", "ms": bot.QUESTION_FOLLOW_UP_MS, "chime": True, "turn": 1}
+    assert d.sent[-2] == {"type": "follow_up", "ms": 4000, "chime": True, "turn": 1}
     assert d.sent[-1] == {"type": "phase", "value": "idle", "turn": 1}
+
+
+def test_question_window_disabled_by_zero_ms():
+    d = Recorder()
+    d._follow_up_ms = 0
+    asked(d, reply("В какой комнате?"))
+    assert follow_ups(d) == [] and d.phases()[-1] == ("idle", 1)
 
 
 def test_request_follow_up_tool_opens_a_window():
