@@ -1,19 +1,19 @@
 # pipecat-voice
 
-Experiment: a [Pipecat](https://github.com/pipecat-ai/pipecat) voice bot (OpenAI Realtime + Home Assistant MCP tools) that speaks the same `/voice` WebSocket protocol as [voice-assistant](https://github.com/maxmaxme/voice-assistant)'s realtime bridge. A Voice PE speaker running the [va-direct firmware](https://github.com/maxmaxme/home-assistant-voice-pe) can be switched to it by changing only its `va_url`.
+A [Pipecat](https://github.com/pipecat-ai/pipecat) voice front-end (OpenAI Realtime) for Voice PE speakers running the [va-direct firmware](https://github.com/maxmaxme/home-assistant-voice-pe). It speaks the same `/voice` WebSocket protocol as [voice-assistant](https://github.com/maxmaxme/voice-assistant)'s realtime bridge, so switching a speaker is just its `va_url`.
 
-Deliberately minimal: no follow-up listening window, no multi-speaker wake arbitration, no memory or DB-backed prompts.
+It only does the voice part: audio, turns, barge-in, LED phases, the question follow-up window. Everything the assistant knows and can do comes from voice-assistant's `/mcp`, called with the speaker's own device token: that authenticates the speaker and returns its tools (Home Assistant plus memory, reminders, time, …) and its system prompt.
+
+Not implemented: the ambient after-every-reply follow-up window (only questions open the mic: `request_follow_up` or a reply ending in "?") and wake arbitration between several speakers.
 
 ## Env
 
 | Var | Required | |
 | --- | --- | --- |
 | `OPENAI_API_KEY` | yes | |
-| `VA_DEVICE_TOKEN` | yes | bearer token the speaker sends on the WS upgrade |
-| `HA_URL`, `HA_TOKEN` | no | HA base URL + long-lived token; without them (or if HA is down) the bot runs with no tools |
+| `VA_MCP_URL` | no | voice-assistant's voice MCP, default `http://voice-assistant:3000/mcp` |
 | `OPENAI_REALTIME_MODEL` | no | defaults to Pipecat's default realtime model |
 | `OPENAI_REALTIME_VOICE` | no | default `marin` |
-| `PIPECAT_INSTRUCTIONS` | no | system prompt |
 | `PORT` | no | default `3002` |
 
 ## Dev
@@ -21,5 +21,5 @@ Deliberately minimal: no follow-up listening window, no multi-speaker wake arbit
 ```bash
 uv sync
 uv run pytest -q
-VA_DEVICE_TOKEN=... OPENAI_API_KEY=... uv run python bot.py
+OPENAI_API_KEY=... VA_MCP_URL=http://localhost:3000/mcp uv run python bot.py
 ```

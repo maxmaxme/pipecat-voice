@@ -1,4 +1,9 @@
 import asyncio
+
+import aiohttp
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 import json
 
 from pipecat.frames.frames import (
@@ -8,6 +13,7 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,
     InputTransportMessageFrame,
     OutputAudioRawFrame,
+    TTSTextFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
@@ -31,12 +37,53 @@ def test_serializer_control_messages():
     assert asyncio.run(s.deserialize("[1]")) is None
 
 
-def test_token_ok(monkeypatch):
-    monkeypatch.setenv("VA_DEVICE_TOKEN", "abc")
-    assert bot.token_ok("Bearer abc")
-    assert not bot.token_ok("Bearer abd")
-    assert not bot.token_ok("abc")
-    assert not bot.token_ok(None)
+def test_bearer():
+    assert bot.bearer("Bearer abc") == "abc"
+    assert bot.bearer("Bearer ") is None
+    assert bot.bearer("abc") is None
+    assert bot.bearer(None) is None
+
+
+def fake_va(status=200):
+    """voice-assistant's /mcp answering prompts/get, as a local aiohttp server."""
+
+    async def handle(request):
+        if request.headers.get("Authorization") != "Bearer good":
+            return web.json_response({"error": "Unauthorized"}, status=401)
+        name = (await request.json())["params"]["name"]
+        text = {"type": "text", "text": f"prompt {name}"}
+        return web.json_response(
+            {"jsonrpc": "2.0", "id": 1, "result": {"messages": [{"role": "user", "content": text}]}},
+            status=status,
+        )
+
+    app = web.Application()
+    app.router.add_post("/mcp", handle)
+    return TestServer(app)
+
+
+def run_va_prompts(token, monkeypatch, status=200):
+    async def go():
+        async with fake_va(status) as server:
+            monkeypatch.setattr(bot, "VA_MCP_URL", str(server.make_url("/mcp")))
+            return await bot.va_prompts(token)
+
+    return asyncio.run(go())
+
+
+def test_va_prompts_reads_the_speaker_prompts(monkeypatch):
+    prompts = run_va_prompts("good", monkeypatch)
+    assert prompts == {name: f"prompt {name}" for name in bot.VA_PROMPTS}
+
+
+def test_va_prompts_unknown_token_is_unauthorized(monkeypatch):
+    with pytest.raises(bot.Unauthorized):
+        run_va_prompts("bad", monkeypatch)
+
+
+def test_va_prompts_server_error_is_not_unauthorized(monkeypatch):
+    with pytest.raises(aiohttp.ClientResponseError):
+        run_va_prompts("good", monkeypatch, status=500)
 
 
 class Recorder(bot.DeviceProtocol):
@@ -130,6 +177,65 @@ def test_reply_audio_passes_inside_a_turn():
     assert d.feed(audio) == [audio]  # before any wake word
     dropped = d.feed(start(1), BotStartedSpeakingFrame(), audio)
     assert all(f is not audio for f in dropped)
+
+
+def reply(text):
+    return TTSTextFrame(text, aggregated_by="sentence")
+
+
+def asked(d, *spoken):
+    d.feed(start(1), UserStartedSpeakingFrame(), UserStoppedSpeakingFrame(), BotStartedSpeakingFrame())
+    d.feed(*spoken, BotStoppedSpeakingFrame())
+
+
+def follow_ups(d):
+    return [m for m in d.sent if m["type"] == "follow_up"]
+
+
+def test_plain_reply_opens_no_window():
+    d = Recorder()
+    asked(d, reply("Включила свет."))
+    assert follow_ups(d) == [] and d.phases()[-1] == ("idle", 1)
+
+
+def test_reply_ending_in_question_opens_a_window_before_idle():
+    d = Recorder()
+    asked(d, reply("В какой "), reply("комнате? "))
+    assert d.sent[-2] == {"type": "follow_up", "ms": bot.QUESTION_FOLLOW_UP_MS, "chime": True, "turn": 1}
+    assert d.sent[-1] == {"type": "phase", "value": "idle", "turn": 1}
+
+
+def test_request_follow_up_tool_opens_a_window():
+    d = Recorder()
+    d.feed(start(1), UserStartedSpeakingFrame(), UserStoppedSpeakingFrame(), BotStartedSpeakingFrame())
+    asyncio.run(d.request_follow_up())
+    d.feed(reply("Скажите, когда будете готовы."), BotStoppedSpeakingFrame())
+    assert len(follow_ups(d)) == 1
+
+
+def test_speech_in_the_window_continues_the_turn_without_start():
+    d = Recorder()
+    asked(d, reply("В какой комнате?"))
+    audio = OutputAudioRawFrame(audio=b"\0\0", sample_rate=24000, num_channels=1)
+    dropped = d.feed(UserStartedSpeakingFrame(), UserStoppedSpeakingFrame(), BotStartedSpeakingFrame(), audio)
+    assert dropped == []
+    assert d.phases()[-3:] == [("listening", 1), ("thinking", 1), ("replying", 1)]
+
+
+def test_speech_after_the_window_is_ignored():
+    d = Recorder()
+    asked(d, reply("В какой комнате?"))
+    d._follow_up_until = 0.0  # window over
+    d.feed(UserStartedSpeakingFrame())
+    assert d.phases()[-1] == ("idle", 1)
+    assert not d.busy
+
+
+def test_wait_for_user_ends_the_turn_silently():
+    d = Recorder()
+    d.feed(start(1), UserStartedSpeakingFrame(), UserStoppedSpeakingFrame())
+    asyncio.run(d.wait_for_user())
+    assert d.phases()[-1] == ("idle", 1) and follow_ups(d) == []
 
 
 def test_ping_works_outside_a_turn():

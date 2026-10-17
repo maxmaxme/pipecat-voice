@@ -1,17 +1,20 @@
 """Pipecat behind the Voice PE speaker's `/voice` WebSocket protocol (proto 2).
 
-An experiment next to voice-assistant's own realtime bridge: same wire shape,
-so pointing a speaker's `va_url` at this port is the only change. Deliberately
-minimal — no follow-up window, no multi-speaker wake arbitration, no
-memory/prompts DB.
+The voice front-end only: audio, turns, LED phases. Everything the assistant
+knows and can do comes from voice-assistant's `/mcp`, called with the speaker's
+own device token — that authenticates the speaker, and returns its tools (Home
+Assistant + memory, reminders, time, …) and its system prompt. Same wire shape
+as voice-assistant's realtime bridge, so pointing a speaker's `va_url` here is
+the only device-side change. No multi-speaker wake arbitration.
 """
 
 import asyncio
-import hmac
 import json
 import os
+import time
 from collections.abc import Awaitable, Callable
 
+import aiohttp
 import uvicorn
 from fastapi import FastAPI, WebSocket
 from loguru import logger
@@ -21,29 +24,37 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     Frame,
+    FunctionCallResultProperties,
     FunctionCallsStartedFrame,
     InputAudioRawFrame,
     InputTransportMessageFrame,
     OutputAudioRawFrame,
     OutputTransportMessageFrame,
     OutputTransportMessageUrgentFrame,
+    TTSTextFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.serializers.base_serializer import FrameSerializer
+from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.mcp_service import MCPClient
 from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
+    AudioInput,
     AudioOutput,
     ClientEvent,
     InputAudioBufferClearEvent,
+    InputAudioNoiseReduction,
     ResponseCancelEvent,
     SessionProperties,
+    TurnDetection,
 )
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.fastapi import (
@@ -58,10 +69,18 @@ DEVICE_MIC_RATE = 16000
 # OpenAI Realtime only takes/gives PCM16 @ 24 kHz, and the speaker plays 24 kHz.
 PIPELINE_RATE = 24000
 
-DEFAULT_INSTRUCTIONS = (
-    "Ты голосовой ассистент умного дома. Отвечай по-русски, коротко, одним-двумя "
-    "предложениями. Для управления устройствами используй инструменты Home Assistant."
-)
+# voice-assistant's voice MCP; speaker-scoped by the device token we forward.
+VA_MCP_URL = os.environ.get("VA_MCP_URL", "http://voice-assistant:3000/mcp")
+VA_PROMPTS = ("voice-system", "tools/wait-for-user", "tools/request-follow-up")
+
+# Mic window after a reply that asked something (request_follow_up, or a
+# reply ending in "?"); the speaker plays its "your turn" chime first.
+QUESTION_FOLLOW_UP_MS = 10_000
+QUESTION_FOLLOW_UP_CHIME = True
+# A follow-up turn has no `start`: the device just streams once its window
+# opens. Accept speech that long after our idle (window + reply drain, the
+# firmware's 1.5 s echo guard and the chime).
+FOLLOW_UP_SLACK_S = 5
 
 # OpenAI caps a Realtime session at 60 min; recycle at 50, waiting up to 8 more
 # for the current turn to finish.
@@ -118,6 +137,13 @@ class DeviceProtocol(FrameProcessor):
         # `idle` = outside a turn; `start` opens one with phase None.
         self._phase: str | None = "idle"
         self._tool_pending = False
+        # The reply's spoken text since the last `thinking`, and whether the
+        # model called request_follow_up — either can open a question window.
+        self._reply_text = ""
+        self._question = False
+        # time.monotonic() until which speech without `start` continues the
+        # turn (the device's follow-up window).
+        self._follow_up_until = 0.0
 
     @property
     def in_turn(self) -> bool:
@@ -125,6 +151,11 @@ class DeviceProtocol(FrameProcessor):
         outside a turn (a cancelled reply's tail, a barge-in's BotStopped) are
         dropped, not sent to the speaker."""
         return self._phase != "idle"
+
+    @property
+    def busy(self) -> bool:
+        """In a turn, or the device's follow-up window may still continue one."""
+        return self.in_turn or time.monotonic() < self._follow_up_until
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -139,9 +170,14 @@ class DeviceProtocol(FrameProcessor):
             return True
         if isinstance(frame, OutputAudioRawFrame):
             return not self.in_turn
-        if isinstance(frame, FunctionCallsStartedFrame):
+        if isinstance(frame, TTSTextFrame):
+            self._reply_text += frame.text
+        elif isinstance(frame, FunctionCallsStartedFrame):
             self._tool_pending = True
         elif isinstance(frame, UserStartedSpeakingFrame):
+            if not self.in_turn and time.monotonic() < self._follow_up_until:
+                # Speech in the follow-up window continues the same turn id.
+                self._phase = None
             await self._set_phase("listening")
         elif isinstance(frame, UserStoppedSpeakingFrame):
             await self._set_phase("thinking")
@@ -154,8 +190,29 @@ class DeviceProtocol(FrameProcessor):
             # shortcut: a tool call followed by no audio at all leaves the LED in
             # `thinking` until the firmware's own watchdog; add an
             # LLMFullResponseEndFrame fallback if that shows up in practice.
-            await self._set_phase("thinking" if self._tool_pending else "idle")
+            if self._tool_pending:
+                await self._set_phase("thinking")
+            else:
+                await self._end_reply()
         return False
+
+    async def _end_reply(self):
+        if self._question or self._reply_text.rstrip().endswith("?"):
+            # Sent right before the idle: the device latches it and opens the
+            # mic once the reply has drained.
+            await self._send_turn(
+                {"type": "follow_up", "ms": QUESTION_FOLLOW_UP_MS, "chime": QUESTION_FOLLOW_UP_CHIME}
+            )
+            self._follow_up_until = time.monotonic() + QUESTION_FOLLOW_UP_MS / 1000 + FOLLOW_UP_SLACK_S
+        await self._set_phase("idle")
+
+    async def request_follow_up(self):
+        """Tool: the model is asking the user something — open the mic after."""
+        self._question = True
+
+    async def wait_for_user(self):
+        """Tool: the audio was noise/echo — end the turn silently, no follow-up."""
+        await self._set_phase("idle")
 
     async def _on_device(self, msg: dict):
         kind = msg.get("type")
@@ -168,6 +225,7 @@ class DeviceProtocol(FrameProcessor):
             self._turn = msg.get("turn")
             self._phase = None
             self._tool_pending = False
+            self._follow_up_until = 0.0
             await self._send_event(ResponseCancelEvent())
             await self.broadcast_interruption()
         elif kind == "interrupt":
@@ -177,13 +235,21 @@ class DeviceProtocol(FrameProcessor):
             # on `start`: the new turn's first audio may already be in there.
             await self._send_event(InputAudioBufferClearEvent())
             await self.broadcast_interruption()
+            self._follow_up_until = 0.0
             await self._set_phase("idle")
 
     async def _set_phase(self, value: str):
         if not self.in_turn or value == self._phase:
             return
         self._phase = value
-        msg = {"type": "phase", "value": value}
+        if value in ("listening", "thinking"):
+            self._reply_text = ""
+        if value == "listening":
+            self._question = False
+        await self._send_turn({"type": "phase", "value": value})
+
+    async def _send_turn(self, msg: dict):
+        """Turn-scoped message: stamped with the device's turn id (proto 2)."""
         if self._turn is not None:
             msg["turn"] = self._turn
         await self._send(msg)
@@ -192,33 +258,54 @@ class DeviceProtocol(FrameProcessor):
         await self.push_frame(OutputTransportMessageUrgentFrame(message=msg))
 
 
-def token_ok(header: str | None) -> bool:
-    expected = os.environ["VA_DEVICE_TOKEN"]
-    token = header.removeprefix("Bearer ").strip() if header and header.startswith("Bearer ") else ""
-    return bool(token) and hmac.compare_digest(token.encode(), expected.encode())
+class Unauthorized(Exception):
+    """voice-assistant doesn't know this speaker token."""
 
 
-async def ha_tools():
-    ha_url, ha_token = os.environ.get("HA_URL"), os.environ.get("HA_TOKEN")
-    if not (ha_url and ha_token):
-        logger.warning("HA_URL/HA_TOKEN not set, running without HA tools")
+def bearer(header: str | None) -> str | None:
+    if not header or not header.startswith("Bearer "):
         return None
+    return header.removeprefix("Bearer ").strip() or None
+
+
+async def va_prompts(token: str) -> dict[str, str]:
+    """The speaker's prompts from voice-assistant; also its authentication.
+
+    Plain JSON-RPC against the stateless MCP endpoint rather than the MCP SDK
+    client: the SDK folds HTTP 401 into a generic error, and telling "unknown
+    speaker" (close 4401) from "voice-assistant down" is the point here.
+    """
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json, text/event-stream"}
+    prompts = {}
+    async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as http:
+        for name in VA_PROMPTS:
+            body = {"jsonrpc": "2.0", "id": 1, "method": "prompts/get", "params": {"name": name}}
+            async with http.post(VA_MCP_URL, json=body) as resp:
+                if resp.status == 401:
+                    raise Unauthorized()
+                resp.raise_for_status()
+                reply = await resp.json()
+            prompts[name] = reply["result"]["messages"][0]["content"]["text"]
+    return prompts
+
+
+async def va_tools(token: str) -> list[FunctionSchema]:
+    """The speaker's tools (HA + voice-assistant's own) with call handlers."""
     mcp = MCPClient(
         server_params=StreamableHttpParameters(
-            url=f"{ha_url.rstrip('/')}/api/mcp",
-            headers={"Authorization": f"Bearer {ha_token}"},
+            url=VA_MCP_URL, headers={"Authorization": f"Bearer {token}"}
         )
     )
     try:
-        return await mcp.tools()
+        return list((await mcp.tools()).standard_tools)
     except Exception as e:
-        # The voice path must survive HA being down — talk without tools.
-        logger.error(f"HA MCP unavailable, running without tools: {e}")
+        # Talking without tools beats a dead speaker.
+        logger.error(f"voice-assistant tools unavailable, running without them: {e}")
         await mcp.close()
-        return None
+        return []
 
 
-async def run_bot(websocket: WebSocket):
+async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str]):
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
@@ -227,17 +314,42 @@ async def run_bot(websocket: WebSocket):
             serializer=VoicePeSerializer(),
         ),
     )
+    device = DeviceProtocol(lambda event: llm.send_client_event(event))
+
+    async def wait_for_user(params: FunctionCallParams):
+        await device.wait_for_user()
+        # run_llm=False: a flow-control call must not trigger another response.
+        await params.result_callback(None, properties=FunctionCallResultProperties(run_llm=False))
+
+    async def request_follow_up(params: FunctionCallParams):
+        await device.request_follow_up()
+        await params.result_callback(None, properties=FunctionCallResultProperties(run_llm=False))
+
+    tools = [
+        FunctionSchema("wait_for_user", prompts["tools/wait-for-user"], {}, [], handler=wait_for_user),
+        FunctionSchema(
+            "request_follow_up", prompts["tools/request-follow-up"], {}, [], handler=request_follow_up
+        ),
+        *await va_tools(token),
+    ]
     model = os.environ.get("OPENAI_REALTIME_MODEL")
     llm = OpenAIRealtimeLLMService(
         api_key=os.environ["OPENAI_API_KEY"],
         settings=OpenAIRealtimeLLMService.Settings(
             **({"model": model} if model else {}),
-            system_instruction=os.environ.get("PIPECAT_INSTRUCTIONS", DEFAULT_INSTRUCTIONS),
+            system_instruction=prompts["voice-system"],
             session_properties=SessionProperties(
                 # Session-level tools go out on connect, before the first turn.
-                tools=await ha_tools(),
+                tools=ToolsSchema(standard_tools=tools),
                 audio=AudioConfiguration(
-                    output=AudioOutput(voice=os.environ.get("OPENAI_REALTIME_VOICE", "marin"))
+                    input=AudioInput(
+                        # voice-assistant's tuned VAD: 0.3 hears quiet far-field
+                        # speech the default 0.5 misses; 900 ms keeps a mid-
+                        # sentence pause from splitting the turn.
+                        turn_detection=TurnDetection(threshold=0.3, silence_duration_ms=900),
+                        noise_reduction=InputAudioNoiseReduction(type="far_field"),
+                    ),
+                    output=AudioOutput(voice=os.environ.get("OPENAI_REALTIME_VOICE", "marin")),
                 ),
             ),
         ),
@@ -252,7 +364,6 @@ async def run_bot(websocket: WebSocket):
     llm._context = context
     llm._llm_needs_conversation_setup = False
     user_agg, assistant_agg = LLMContextAggregatorPair(context)
-    device = DeviceProtocol(llm.send_client_event)
     pipeline = Pipeline(
         [transport.input(), user_agg, llm, device, transport.output(), assistant_agg]
     )
@@ -285,10 +396,11 @@ async def run_bot(websocket: WebSocket):
     async def recycle_before_session_cap():
         # OpenAI ends a Realtime session at 60 min and Pipecat doesn't
         # reconnect. Drop the speaker between turns before that; its reconnect
-        # gets a fresh session (and re-fetches HA tools if HA was down).
+        # gets a fresh session, re-reads tools and prompt from voice-assistant
+        # (web-panel edits, new memory) and retries them if it was down.
         await asyncio.sleep(SESSION_RECYCLE_SECS)
         for _ in range(SESSION_GRACE_SECS):
-            if not device.in_turn:
+            if not device.busy:
                 break
             await asyncio.sleep(1)
         logger.info("recycling speaker connection ahead of OpenAI's session cap")
@@ -309,14 +421,23 @@ app = FastAPI()
 @app.websocket("/voice")
 async def voice(websocket: WebSocket):
     await websocket.accept()
-    if not token_ok(websocket.headers.get("authorization")):
+    token = bearer(websocket.headers.get("authorization"))
+    try:
+        if not token:
+            raise Unauthorized()
+        prompts = await va_prompts(token)
+    except Unauthorized:
         await websocket.close(4401, "unauthorized")
+        return
+    except Exception as e:
+        logger.error(f"voice-assistant unreachable: {e}")
+        await websocket.close(1011, "voice-assistant unavailable")
         return
     await websocket.send_text(
         json.dumps({"type": "hello", "proto": PROTO_VERSION, "audioOut": "pcm", "wakeChime": True})
     )
     logger.info("speaker connected")
-    await run_bot(websocket)
+    await run_bot(websocket, token, prompts)
     logger.info("speaker disconnected")
 
 
