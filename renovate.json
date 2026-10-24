@@ -17,6 +17,12 @@
       "description": "Majors wait for a tick in the Dependency Dashboard",
       "matchUpdateTypes": ["major"],
       "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Python (image + .python-version) gets its own PR: a version whose wheels aren't out yet stays red alone instead of blocking the non-major group",
+      "matchPackageNames": ["python"],
+      "groupName": "python",
+      "automerge": true
     }
   ]
 }
