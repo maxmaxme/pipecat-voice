@@ -1,0 +1,28 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":dependencyDashboard", ":semanticCommits", ":timezone(Europe/Madrid)"],
+  "schedule": ["* 6-10 * * *"],
+  "prHourlyLimit": 4,
+  "prConcurrentLimit": 8,
+  "minimumReleaseAge": "3 days",
+  "lockFileMaintenance": { "enabled": true, "automerge": true, "schedule": ["* 6-10 * * *"] },
+  "packageRules": [
+    {
+      "description": "Minor/patch/digest bumps ride one weekly PR and merge themselves once CI is green",
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "groupName": "non-major dependencies",
+      "automerge": true
+    },
+    {
+      "description": "Majors wait for a tick in the Dependency Dashboard",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Python base image stays on 3.12.x: CI runs on setup-uv, not this image, so a 3.13 bump would automerge untested",
+      "matchPackageNames": ["python"],
+      "matchDatasources": ["docker"],
+      "allowedVersions": "/^3\\.12[.-]/"
+    }
+  ]
+}
