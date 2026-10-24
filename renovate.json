@@ -17,12 +17,6 @@
       "description": "Majors wait for a tick in the Dependency Dashboard",
       "matchUpdateTypes": ["major"],
       "dependencyDashboardApproval": true
-    },
-    {
-      "description": "Python base image stays on 3.12.x: CI runs on setup-uv, not this image, so a 3.13 bump would automerge untested",
-      "matchPackageNames": ["python"],
-      "matchDatasources": ["docker"],
-      "allowedVersions": "/^3\\.12[.-]/"
     }
   ]
 }
