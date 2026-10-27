@@ -3,9 +3,8 @@
 The voice front-end only: audio, turns, LED phases. Everything the assistant
 knows and can do comes from voice-assistant's `/mcp`, called with the speaker's
 own device token — that authenticates the speaker, and returns its tools (Home
-Assistant + memory, reminders, time, …) and its system prompt. Same wire shape
-as voice-assistant's realtime bridge, so pointing a speaker's `va_url` here is
-the only device-side change. No multi-speaker wake arbitration.
+Assistant + memory, reminders, time, …) and its system prompt. No multi-speaker
+wake arbitration.
 """
 
 import asyncio
