@@ -10,6 +10,7 @@ from aiohttp.test_utils import TestServer
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    FunctionCallFromLLM,
     FunctionCallsStartedFrame,
     InputAudioRawFrame,
     InputTransportMessageFrame,
@@ -172,6 +173,12 @@ class Recorder(bot.DeviceProtocol):
         return [(m["value"], m.get("turn")) for m in self.sent if m["type"] == "phase"]
 
 
+def calls(*names):
+    return FunctionCallsStartedFrame(
+        function_calls=[FunctionCallFromLLM(function_name=n, tool_call_id=n, arguments={}, context=None) for n in names]
+    )
+
+
 def start(turn):
     return InputTransportMessageFrame(message={"type": "start", "turn": turn})
 
@@ -208,7 +215,7 @@ def test_tool_preamble_keeps_the_turn_open():
         UserStartedSpeakingFrame(),
         UserStoppedSpeakingFrame(),
         BotStartedSpeakingFrame(),  # "сейчас включу…"
-        FunctionCallsStartedFrame(function_calls=[]),
+        calls("HassTurnOn"),
         BotStoppedSpeakingFrame(),
         BotStartedSpeakingFrame(),  # reply after the tool result
         BotStoppedSpeakingFrame(),
@@ -225,6 +232,15 @@ def test_interrupt_cancels_and_drops_the_late_reply():
     audio = OutputAudioRawFrame(audio=b"\0\0", sample_rate=24000, num_channels=1)
     assert d.feed(BotStartedSpeakingFrame(), audio) == [audio]
     assert d.phases()[-1] == ("idle", 1)
+
+
+def test_flow_tool_after_a_question_does_not_hold_thinking():
+    d = Recorder()
+    d.feed(start(1), UserStartedSpeakingFrame(), UserStoppedSpeakingFrame(), BotStartedSpeakingFrame())
+    d.feed(calls("request_follow_up"))
+    asyncio.run(d.request_follow_up())
+    d.feed(reply("Кому напомнить."), BotStoppedSpeakingFrame())
+    assert len(follow_ups(d)) == 1 and d.phases()[-1] == ("idle", 1)
 
 
 def test_reply_audio_passes_inside_a_turn():
