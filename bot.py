@@ -106,6 +106,8 @@ FOLLOW_UP_SLACK_S = 5
 # followUpChime).
 QUESTION_WINDOW_MS = 4_000
 QUESTION_CHIME = True
+# Device-flow tools handled in-process (see run_bot).
+FLOW_TOOLS = {"wait_for_user", "request_follow_up"}
 
 # An OpenAI session that fails this soon after connect will most likely fail
 # again on reconnect (bad key, no quota, a panel setting OpenAI rejects): keep
@@ -236,7 +238,10 @@ class DeviceProtocol(FrameProcessor):
         if isinstance(frame, TTSTextFrame):
             self._reply_text += frame.text
         elif isinstance(frame, FunctionCallsStartedFrame):
-            self._tool_pending = True
+            # Flow tools run with run_llm=False: no reply follows them, so they
+            # must not hold the turn in `thinking`.
+            if any(c.function_name not in FLOW_TOOLS for c in frame.function_calls):
+                self._tool_pending = True
         elif isinstance(frame, UserStartedSpeakingFrame):
             if not self.in_turn and time.monotonic() < self._follow_up_until:
                 # Speech in the follow-up window continues the same turn id.
