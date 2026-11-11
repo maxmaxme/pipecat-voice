@@ -338,3 +338,59 @@ def test_ping_works_outside_a_turn():
     d = Recorder()
     d.feed(InputTransportMessageFrame(message={"type": "ping"}))
     assert d.sent == [{"type": "pong"}]
+
+
+def test_thinking_watchdog_ends_a_turn_with_no_reply(monkeypatch):
+    d = Recorder()
+    d.feed(start(1), UserStartedSpeakingFrame(), UserStoppedSpeakingFrame())
+    began = time.monotonic()
+    monkeypatch.setattr(bot.time, "monotonic", lambda: began + bot.THINKING_TIMEOUT_S)
+    assert d.thinking_for() >= bot.THINKING_TIMEOUT_S
+    asyncio.run(d.give_up())
+    assert d.events[-1] == "response.cancel"
+    assert d.sent[-2:] == [{"type": "error", "turn": 1}, {"type": "phase", "value": "idle", "turn": 1}]
+    assert not d.in_turn and d.thinking_for() == 0.0
+
+
+def test_thinking_for_is_zero_outside_thinking():
+    d = Recorder()
+    assert d.thinking_for() == 0.0
+    d.feed(start(1), UserStartedSpeakingFrame(), UserStoppedSpeakingFrame(), BotStartedSpeakingFrame())
+    assert d.thinking_for() == 0.0  # replying
+
+
+def test_response_done_is_logged(monkeypatch):
+    from loguru import logger
+    from pipecat.services.openai.realtime import events
+
+    async def parent(self, evt):
+        pass
+
+    monkeypatch.setattr(bot.OpenAIRealtimeLLMService, "_handle_evt_response_done", parent)
+    lines = []
+    sink = logger.add(lambda m: lines.append(m.record["message"]), level="INFO")
+    try:
+        llm = object.__new__(bot.RealtimeLLM)  # the handler needs none of the service's state
+        evt = events.parse_server_event(
+            json.dumps(
+                {
+                    "type": "response.done",
+                    "event_id": "e1",
+                    "response": {
+                        "id": "r1",
+                        "object": "realtime.response",
+                        "status": "cancelled",
+                        "status_details": {"type": "cancelled", "reason": "client_cancelled"},
+                        "output": [],
+                        "usage": {"total_tokens": 30, "input_tokens": 25, "output_tokens": 5},
+                    },
+                }
+            )
+        )
+        asyncio.run(llm._handle_evt_response_done(evt))
+    finally:
+        logger.remove(sink)
+    assert lines == [
+        "openai response cancelled: no output (in 25 / out 5 tokens)"
+        " {'type': 'cancelled', 'reason': 'client_cancelled'}"
+    ]
