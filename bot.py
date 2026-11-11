@@ -119,6 +119,11 @@ EARLY_FAILURE_HOLD_S = 60
 SESSION_RECYCLE_SECS = 50 * 60
 SESSION_GRACE_SECS = 8 * 60
 
+# Longest a turn may sit in `thinking` with nothing spoken. The firmware only
+# watches `listening`, so a reply OpenAI never sends (or a model looping on
+# tools) would otherwise hold the speaker until someone presses its button.
+THINKING_TIMEOUT_S = 25
+
 
 class VoicePeSerializer(FrameSerializer):
     """Binary frames are raw PCM16 mono audio; text frames are JSON control."""
@@ -150,6 +155,21 @@ class VoicePeSerializer(FrameSerializer):
             logger.warning(f"bad device message: {data!r}")
             return None
         return InputTransportMessageFrame(message=msg)
+
+
+class RealtimeLLM(OpenAIRealtimeLLMService):
+    """Logs how each OpenAI response ended: one that is cancelled, cut short or
+    has no audio is otherwise invisible at INFO, and the token counts are what
+    the turn cost."""
+
+    # shortcut: overrides a private handler, re-check on a Pipecat bump.
+    async def _handle_evt_response_done(self, evt):
+        r = evt.response
+        kinds = ", ".join(item.type for item in r.output or []) or "no output"
+        tokens = f" (in {r.usage.input_tokens} / out {r.usage.output_tokens} tokens)" if r.usage else ""
+        details = f" {r.status_details}" if r.status != "completed" and r.status_details else ""
+        logger.info(f"openai response {r.status}: {kinds}{tokens}{details}")
+        await super()._handle_evt_response_done(evt)
 
 
 class TranscriptLog(FrameProcessor):
@@ -203,6 +223,7 @@ class DeviceProtocol(FrameProcessor):
         # the device has been quiet.
         self._had_turn = False
         self._idle_since = time.monotonic()
+        self._thinking_since = 0.0
 
     @property
     def in_turn(self) -> bool:
@@ -221,6 +242,17 @@ class DeviceProtocol(FrameProcessor):
         if not self._had_turn or self.busy:
             return 0.0
         return time.monotonic() - max(self._idle_since, self._follow_up_until)
+
+    def thinking_for(self) -> float:
+        """Seconds the turn has sat in `thinking`; 0 in any other phase."""
+        return time.monotonic() - self._thinking_since if self._phase == "thinking" else 0.0
+
+    async def give_up(self):
+        """Watchdog: end a turn stuck in `thinking`. The speaker plays its error
+        chime on `error` and goes idle."""
+        await self._send_event(ResponseCancelEvent())
+        await self._send_turn({"type": "error"})
+        await self._set_phase("idle")
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -255,9 +287,8 @@ class DeviceProtocol(FrameProcessor):
         elif isinstance(frame, BotStoppedSpeakingFrame) and self._phase == "replying":
             # A spoken preamble before a tool call ("сейчас включу…") is not the
             # end of the turn — the reply after the tool result is.
-            # shortcut: a tool call followed by no audio at all leaves the LED in
-            # `thinking` until the firmware's own watchdog; add an
-            # LLMFullResponseEndFrame fallback if that shows up in practice.
+            # A tool call followed by no audio at all is ended by the thinking
+            # watchdog (THINKING_TIMEOUT_S).
             if self._tool_pending:
                 await self._set_phase("thinking")
             else:
@@ -316,6 +347,8 @@ class DeviceProtocol(FrameProcessor):
         self._phase = value
         if value == "idle":
             self._idle_since = time.monotonic()
+        if value == "thinking":
+            self._thinking_since = time.monotonic()
         if value in ("listening", "thinking"):
             self._reply_text = ""
         if value == "listening":
@@ -462,7 +495,7 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str], cfg
         *await va_tools(token),
     ]
     effort = cfg.get("reasoningEffort")
-    llm = OpenAIRealtimeLLMService(
+    llm = RealtimeLLM(
         api_key=os.environ["OPENAI_API_KEY"],
         settings=OpenAIRealtimeLLMService.Settings(
             **({"model": cfg["model"]} if cfg.get("model") else {}),
@@ -538,6 +571,10 @@ async def run_bot(websocket: WebSocket, token: str, prompts: dict[str, str], cfg
         #   reconnect: go between turns at 50, mid-turn at 58 at the latest.
         while True:
             await asyncio.sleep(1)
+            # Not a recycle: the session itself is fine, this turn just got no reply.
+            if device.thinking_for() >= THINKING_TIMEOUT_S:
+                logger.warning(f"no reply after {THINKING_TIMEOUT_S} s of thinking, ending the turn")
+                await device.give_up()
             age = time.monotonic() - connected
             if drop_at is not None and time.monotonic() >= drop_at:
                 reason = "OpenAI session failed"
